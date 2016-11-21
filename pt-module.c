@@ -23,7 +23,6 @@
 #include "pt-module.h"
 
 static int tracked_pid = -1;
-static int start;
 
 static u64 pt_buffer;
 static u64* topa;
@@ -73,9 +72,9 @@ static int init_mask_ptrs(void) {
 }
 
 static int check_pid(int pid) {
-    struct task_struct* task = pid_task(find_vpid(tracked_pid), PIDTYPE_PID);
+    struct task_struct* task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if(!task) {
-        pr_err("pid %d task not found\n", tracked_pid);
+        pr_err("pid %d task not found\n", pid);
         return -EINVAL;
     }
     return 0;
@@ -107,7 +106,6 @@ static int pt_start(void) {
     init_mask_ptrs();
     ctl |= TRACE_EN;
     wrmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, ctl);
-    start = 1;
     pr_err("pt contorl succeeded\n");
     pr_info("start pt succeed, ctl: %llx\n", ctl);
     return 0;
@@ -122,7 +120,6 @@ static int pt_stop(void) {
     }
     ctl &= ~TRACE_EN;
     wrmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, ctl);
-    start = 0;
     pr_info("stop pt succeed\n");
     return 0;
 }
@@ -172,7 +169,7 @@ static int pt_int_handler(unsigned int val, struct pt_regs *regs) {
     }
     if(status & STATUS_STOP) {
         pr_info("pt stop in topa\n");
-        kill_pid(find_vpid(tracked_pid), SIGINT, 1);
+        kill_pid(find_vpid(tracked_pid), SIGTRAP, 1);
         pt_stop();
     }
     else {
@@ -227,10 +224,17 @@ static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         pr_info("set pid succeeded in ioctl: %d\n", tracked_pid);
         return 0;
     }
-    case PT_GET_START: {
-        return put_user(start, (int*)arg);
+    case PT_GET_STATUS: {
+        u64 ctl;
+        rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, &ctl);
+        if(ctl & TRACE_EN) {
+            return put_user(1, (int*)arg);
+        }
+        else {
+            return put_user(0, (int*)arg);
+        }
     }
-    case PT_SET_START: {
+    case PT_SET_STATUS: {
         int ret;
         if(arg)
             ret = pt_start();
@@ -243,12 +247,12 @@ static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         u64 ctl;
         rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, &ctl);
         if(ctl & TRACE_EN) {
-            pr_err("pt is continuing\n");
+            pr_err("pt is continuing, please stop it at first\n");
             return -EINVAL;
         }
         rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_OUTPUT_MASK, &offset);
         pr_info("offset: %llx\n", offset);
-		return put_user(offset >> 32, (int*)arg);
+		return put_user(offset >> 32, (unsigned long*)arg);
 	}
 	default:
 		return -ENOTTY;
