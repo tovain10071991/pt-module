@@ -18,7 +18,7 @@
 #include <asm/msr.h>
 #include <asm/processor.h>
 
-#include <linux/kdebug.h>
+#include <asm/nmi.h>
 
 static int tracked_pid = -1;
 static int start;
@@ -48,7 +48,7 @@ static u64* topa;
 #define CYC_MASK	(0xf << 19)
 #define PSB_MASK	(0xf << 24)
 
-#define PT_ERROR	BIT_ULL(4)
+#define STATUS_ERROR	BIT_ULL(4)
 #define STATUS_STOP		BIT_ULL(5)
 
 static void wrmsr64_safe_on_cpu(int cpu, u32 reg, u64 val) {
@@ -80,6 +80,7 @@ static int pt_start(void) {
     }
     if(tracked_pid == -1) {
         pr_err("tracked pid not set\n");
+        start = 0;
         return -EINVAL;
     }
     // set cr3 filtering
@@ -150,7 +151,7 @@ module_param_cb(pid, &pid_ops, &tracked_pid, 0644);
 MODULE_PARM_DESC(pid, "Set to pid to be tracked");
 
 static int init_buffer(void) {
-    pt_buffer = __get_free_pages(GFP_KERNEL|__GFP_ZERO, 0);
+    pt_buffer = __get_free_pages(GFP_KERNEL|__GFP_ZERO, 9);
     if (!pt_buffer) {
         pr_warn("Cannot allocate pt buffer\n");
         return -ENOMEM;
@@ -164,8 +165,8 @@ static int init_buffer(void) {
         return -ENOMEM;
 	}
     pr_info("allocate topa succeed: %p\n", topa);
-    topa[0] = (u64)__pa(pt_buffer) | (0 << 6) | TOPA_INT;
-    // topa[1] = (u64)__pa(topa) | TOPA_END;
+    topa[0] = (u64)__pa(pt_buffer) | (9 << 6) | TOPA_STOP | TOPA_INT;
+    topa[1] = (u64)__pa(topa) | TOPA_END;
     return 0;
 }
 
@@ -181,31 +182,39 @@ static int free_buffer(void) {
     return 0;
 }
 
-static int __kprobes pt_int_handler(struct notifier_block *self, unsigned long cmd, void *__args) {
-    printk(KERN_INFO "reach pt PMI interrupt!!\n");
+static int pt_int_handler(unsigned int val, struct pt_regs *regs) {
+    u64 status;
+    pr_err("reach pt PMI interrupt!!\n");
     pr_err("current cpu: %d\n", get_cpu());
-    // apic_write(APIC_LVTPC,APIC_DM_NMI);
-    pt_stop();
+    
+    // check if stop and no error
+    rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_STATUS, &status);
+    if(status & STATUS_ERROR) {
+        pr_err("why have a error, status: %llx\n", status);
+        return NMI_HANDLED;
+    }
+    if(status & STATUS_STOP) {
+        pr_info("pt stop in topa\n");
+        kill_pid(find_vpid(tracked_pid), SIGINT, 1);
+        pt_stop();
+    }
+    else {
+        pr_info("maybe non-relavent\n");
+    }
 
-    return NOTIFY_STOP;
+    return NMI_DONE;
 }
-
-static __read_mostly struct notifier_block pt_int_notifier = {
-    .notifier_call          = pt_int_handler,
-    .next                   = NULL,
-    .priority               = 0
-};
 
 static int register_pmi_handler(void) {
     u32 lvtpc = apic_read(APIC_LVTPC);
     pr_info("lvt pc: %x\n", lvtpc);
     apic_write(APIC_LVTPC,APIC_DM_NMI);
-    register_die_notifier(&pt_int_notifier);
+    register_nmi_handler(NMI_LOCAL, pt_int_handler, 0, "PT-INT");
     return 0;
 }
 
 static int unregister_pmi_handler(void) {
-    unregister_die_notifier(&pt_int_notifier);
+    unregister_nmi_handler(NMI_LOCAL, "PT-INT");
     return 0;
 }
 
@@ -235,7 +244,7 @@ static int register_device(void) {
 static int config_pt(void) {
     u64 ctl = 0;
     // rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, &ctl);
-    ctl |= CTL_USER | TO_PA | DIS_RETC | BRANCH_EN;
+    ctl |= CTL_USER | TO_PA | CR3_FILTER | DIS_RETC | BRANCH_EN;
     wrmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, ctl);
     return 0;
 }
