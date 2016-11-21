@@ -72,6 +72,15 @@ static int init_mask_ptrs(void) {
     return 0;
 }
 
+static int check_pid(int pid) {
+    struct task_struct* task = pid_task(find_vpid(tracked_pid), PIDTYPE_PID);
+    if(!task) {
+        pr_err("pid %d task not found\n", tracked_pid);
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static int pt_start(void) {
     struct task_struct* task = NULL;
     u64 cr3, ctl;
@@ -82,7 +91,6 @@ static int pt_start(void) {
     }
     if(tracked_pid == -1) {
         pr_err("tracked pid not set\n");
-        start = 0;
         return -EINVAL;
     }
     // set cr3 filtering
@@ -99,6 +107,7 @@ static int pt_start(void) {
     init_mask_ptrs();
     ctl |= TRACE_EN;
     wrmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, ctl);
+    start = 1;
     pr_err("pt contorl succeeded\n");
     pr_info("start pt succeed, ctl: %llx\n", ctl);
     return 0;
@@ -113,44 +122,10 @@ static int pt_stop(void) {
     }
     ctl &= ~TRACE_EN;
     wrmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, ctl);
+    start = 0;
     pr_info("stop pt succeed\n");
     return 0;
 }
-
-static int start_set(const char *val, const struct kernel_param *kp)
-{
-    int ret;
-    ret = param_set_int(val, kp);
-    pr_info("reach start_set, val: %d\n", start);
-    if(start == 1)
-        pt_start();
-    else
-        pt_stop();
-    return ret;
-}
-
-static int pid_set(const char *val, const struct kernel_param *kp)
-{
-    int ret;
-    ret = param_set_int(val, kp);
-    pr_info("reach pid_set, val: %d\n", tracked_pid);
-    return ret;
-}
-
-static struct kernel_param_ops start_ops = {
-	.set = start_set,
-	.get = param_get_int,
-};
-
-static struct kernel_param_ops pid_ops = {
-	.set = pid_set,
-	.get = param_get_int,
-};
-
-module_param_cb(start, &start_ops, &start, 0644);
-MODULE_PARM_DESC(start, "Set to 1 to start trace, or 0 to stop");
-module_param_cb(pid, &pid_ops, &tracked_pid, 0644);
-MODULE_PARM_DESC(pid, "Set to pid to be tracked");
 
 static int init_buffer(void) {
     pt_buffer = __get_free_pages(GFP_KERNEL|__GFP_ZERO, 9);
@@ -203,7 +178,7 @@ static int pt_int_handler(unsigned int val, struct pt_regs *regs) {
     else {
         pr_info("maybe non-relavent\n");
     }
-
+    apic_write(APIC_LVTPC,APIC_DM_NMI);
     return NMI_DONE;
 }
 
@@ -240,6 +215,29 @@ static int pt_mmap(struct file *file, struct vm_area_struct *vma) {
 
 static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 	switch (cmd) {
+    case PT_GET_PID: {
+        return put_user(tracked_pid, (int*)arg);
+    }
+    case PT_SET_PID: {
+        if(check_pid(arg)) {
+            pr_err("set pid failed in ioctl\n");
+            return -EINVAL;
+        }
+        tracked_pid = arg;
+        pr_info("set pid succeeded in ioctl: %d\n", tracked_pid);
+        return 0;
+    }
+    case PT_GET_START: {
+        return put_user(start, (int*)arg);
+    }
+    case PT_SET_START: {
+        int ret;
+        if(arg)
+            ret = pt_start();
+        else
+            ret = pt_stop();
+        return ret;
+    }
 	case PT_GET_SIZE: {
         u64 offset;
         u64 ctl;
@@ -250,7 +248,7 @@ static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         }
         rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_OUTPUT_MASK, &offset);
         pr_info("offset: %llx\n", offset);
-		return put_user(offset >> 32,(int *)arg);
+		return put_user(offset >> 32, (int*)arg);
 	}
 	default:
 		return -ENOTTY;
