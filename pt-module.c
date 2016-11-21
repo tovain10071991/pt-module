@@ -210,6 +210,8 @@ static int pt_mmap(struct file *file, struct vm_area_struct *vma) {
 			       vma->vm_page_prot);
 }
 
+static int finish = 1;
+
 static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 	switch (cmd) {
     case PT_GET_PID: {
@@ -230,16 +232,25 @@ static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         if(ctl & TRACE_EN) {
             return put_user(1, (int*)arg);
         }
+        else if(finish){
+            return put_user(2, (int*)arg);
+        }
         else {
             return put_user(0, (int*)arg);
         }
     }
     case PT_SET_STATUS: {
         int ret;
-        if(arg)
+        if(arg == 1) {
+            finish = 0;
             ret = pt_start();
-        else
+        }
+        else if(arg == 0)
             ret = pt_stop();
+        else {
+            finish = 1;
+            ret = pt_stop();
+        }
         return ret;
     }
 	case PT_GET_SIZE: {
