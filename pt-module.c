@@ -20,6 +20,8 @@
 
 #include <asm/nmi.h>
 
+#include "pt-module.h"
+
 static int tracked_pid = -1;
 static int start;
 
@@ -218,15 +220,51 @@ static int unregister_pmi_handler(void) {
     return 0;
 }
 
-/*
+static int pt_mmap(struct file *file, struct vm_area_struct *vma) {
+	unsigned long len = vma->vm_end - vma->vm_start;
+	unsigned long buffer_size = PAGE_SIZE << 9;
+
+	vma->vm_flags &= ~VM_MAYWRITE;
+
+	if (len % PAGE_SIZE || len != buffer_size || vma->vm_pgoff)
+		return -EINVAL;
+
+	if (vma->vm_flags & VM_WRITE)
+		return -EPERM;
+
+	return remap_pfn_range(vma, vma->vm_start,
+			       __pa(pt_buffer) >> PAGE_SHIFT,
+			       buffer_size,
+			       vma->vm_page_prot);
+}
+
+static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+	switch (cmd) {
+	case PT_GET_SIZE: {
+        u64 offset;
+        u64 ctl;
+        rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, &ctl);
+        if(ctl & TRACE_EN) {
+            pr_err("pt is continuing\n");
+            return -EINVAL;
+        }
+        rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_OUTPUT_MASK, &offset);
+        pr_info("offset: %llx\n", offset);
+		return put_user(offset >> 32,(int *)arg);
+	}
+	default:
+		return -ENOTTY;
+	}
+}
+
 static const struct file_operations pt_fops = {
 	.owner = THIS_MODULE,
-	.mmap =	simple_pt_mmap,
-	.unlocked_ioctl = simple_pt_ioctl,
+	.mmap =	pt_mmap,
+	.unlocked_ioctl = pt_ioctl,
 	.llseek = noop_llseek,
 };
 
-static struct miscdevice simple_pt_miscdev = {
+static struct miscdevice pt_miscdev = {
 	MISC_DYNAMIC_MINOR,
 	"pt-module",
 	&pt_fops
@@ -237,10 +275,15 @@ static int register_device(void) {
     err = misc_register(&pt_miscdev);	// register device
 	if (err < 0) {
 		pr_err("Cannot register simple-pt device\n");
-		return err;
 	}
+    return err;
 }
-*/
+
+static int unregister_device(void) {
+    misc_deregister(&pt_miscdev);
+    return 0;
+}
+
 static int config_pt(void) {
     u64 ctl = 0;
     // rdmsr64_safe_on_cpu(0, MSR_IA32_RTIT_CTL, &ctl);
@@ -281,7 +324,13 @@ static int pt_init(void) {
         return err;
     }
     // register device
-    // register_device();
+    err = register_device();
+    if(err) {
+        pr_err("init module failed when register device\n");
+        free_buffer();
+        unregister_pmi_handler();
+        return err;
+    }
     printk("init module done\n");
     
     return 0;
@@ -294,6 +343,7 @@ static void pt_exit(void) {
     pr_info("buffer offset: %llx\n", offset >> 32);
     free_buffer();
     unregister_pmi_handler();
+    unregister_device();
 }
 
 module_init(pt_init);
